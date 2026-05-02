@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Generated outputs (re-creatable by running the tool)
+original_*.png
+compare_*.png
+spacing_*.png
+grid_*.png
+sweep_*.png
+zeta_curves.png
+convergence_*.png
+gamma_field_*.png
+sensitivity_*.png
+zplus_verify_report.dat
+
+# Large binary grid data (keep reference grids tracked, ignore generated)
+adaptive_*.dat
+gamma_field_*.dat
+sensitivity_*.dat
+grid_data_*.txt
+
+# Temporary / test artifacts
+testing/*.pyc
+testing/compare_*.png
+testing/grid_*.png
+testing/adaptive_*.dat
+testing/gamma_field_*.dat
+testing/gamma_field_*.png
+testing/grid_data_*.txt
