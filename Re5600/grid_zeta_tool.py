@@ -97,6 +97,164 @@ def parse_tecplot_dat(filepath):
     return x, y, ni, nj
 
 
+def infer_grid_scale(x, LY=9.0):
+    """Return multiplier from stored grid units to code units."""
+    x_max = float(x[0, -1])
+    if x_max < 0.5 * LY:
+        return 1.0 / (x_max / LY)
+    return 1.0
+
+
+def _periodic_row_value(row, idx, period_offset):
+    """Periodic row lookup for grids that include both 0 and L endpoints."""
+    n = len(row)
+    period_nodes = n - 1
+    if idx < 0:
+        return row[idx + period_nodes] - period_offset
+    if idx >= n:
+        return row[idx - period_nodes] + period_offset
+    return row[idx]
+
+
+def _wall_unit_tangent(x_wall, z_wall, period_offset=None):
+    """Unit tangent along a wall."""
+    ni = len(x_wall)
+    tx = np.empty(ni, dtype=float)
+    tz = np.empty(ni, dtype=float)
+
+    if ni < 2:
+        raise ValueError("Need at least 2 wall points to compute tangents")
+
+    if period_offset is not None and ni >= 7:
+        # Same 6th-order periodic derivative used by the z+ post-processor.
+        weights = {
+            -3: -1.0 / 60.0,
+            -2:  9.0 / 60.0,
+            -1: -45.0 / 60.0,
+             1:  45.0 / 60.0,
+             2: -9.0 / 60.0,
+             3:  1.0 / 60.0,
+        }
+        for i in range(ni):
+            tx[i] = sum(
+                w * _periodic_row_value(x_wall, i + k, period_offset)
+                for k, w in weights.items())
+            tz[i] = sum(
+                w * _periodic_row_value(z_wall, i + k, 0.0)
+                for k, w in weights.items())
+    else:
+        tx[1:-1] = 0.5 * (x_wall[2:] - x_wall[:-2])
+        tz[1:-1] = 0.5 * (z_wall[2:] - z_wall[:-2])
+        tx[0] = x_wall[1] - x_wall[0]
+        tz[0] = z_wall[1] - z_wall[0]
+        tx[-1] = x_wall[-1] - x_wall[-2]
+        tz[-1] = z_wall[-1] - z_wall[-2]
+
+    length = np.hypot(tx, tz)
+    if np.any(length <= 1e-30):
+        raise ValueError("Degenerate wall tangent encountered")
+    return tx / length, tz / length
+
+
+def wall_normal_first_cell_spacing(x, y, wall, scale_factor=1.0):
+    """
+    Compute first-cell wall-normal spacing from grid geometry.
+
+    The normal direction is selected so that it points from the wall node
+    toward the first interior node.  This matches the bottom-wall
+    n-projection used by the z+ post-processing data.
+    """
+    if wall == "bottom":
+        jw, ji = 0, 1
+    elif wall == "top":
+        jw, ji = -1, -2
+    else:
+        raise ValueError("wall must be 'bottom' or 'top'")
+
+    xs = x * scale_factor
+    ys = y * scale_factor
+    period_offset = xs[jw, -1] - xs[jw, 0]
+    tx, tz = _wall_unit_tangent(
+        xs[jw, :], ys[jw, :], period_offset=period_offset)
+
+    # One of the two wall normals.  Flip locally to point into the domain.
+    nx = -tz
+    nz = tx
+    vx = xs[ji, :] - xs[jw, :]
+    vz = ys[ji, :] - ys[jw, :]
+    dot = vx * nx + vz * nz
+    flip = dot < 0.0
+    nx[flip] *= -1.0
+    nz[flip] *= -1.0
+    dot[flip] *= -1.0
+
+    return np.abs(dot), nx, nz
+
+
+def wall_normal_projection_factors(x, y, scale_factor=1.0):
+    """
+    Ratio between wall-normal first-cell distance and vertical first-cell step.
+
+    Mode 3 designs vertical Vinokur spacing column-by-column.  On the sloped
+    bottom wall, the physical z+ distance is the normal projection, so the
+    vertical spacing must be multiplied by this factor.
+    """
+    ys = y * scale_factor
+    dn_bot, _, _ = wall_normal_first_cell_spacing(
+        x, y, "bottom", scale_factor=scale_factor)
+    dn_top, _, _ = wall_normal_first_cell_spacing(
+        x, y, "top", scale_factor=scale_factor)
+
+    dz_bot = np.abs(ys[1, :] - ys[0, :])
+    dz_top = np.abs(ys[-1, :] - ys[-2, :])
+
+    factor_bot = np.divide(
+        dn_bot, dz_bot, out=np.ones_like(dn_bot), where=dz_bot > 1e-30)
+    factor_top = np.divide(
+        dn_top, dz_top, out=np.ones_like(dn_top), where=dz_top > 1e-30)
+    return factor_bot, factor_top
+
+
+def interpolate_wall_series(x_src, values, x_target):
+    """Interpolate a 1D wall series onto target streamwise stations."""
+    x_src = np.asarray(x_src, dtype=float)
+    values = np.asarray(values, dtype=float)
+    x_target = np.asarray(x_target, dtype=float)
+
+    if len(x_src) != len(values):
+        raise ValueError("x_src and values must have the same length")
+    if len(x_src) < 2:
+        raise ValueError("Need at least 2 source points for interpolation")
+
+    order = np.argsort(x_src)
+    xs = x_src[order]
+    vs = values[order]
+
+    if len(xs) == len(x_target) and np.allclose(xs, x_target, rtol=0.0, atol=1e-8):
+        return vs.copy()
+
+    lo = xs[0]
+    hi = xs[-1]
+    period = hi - lo
+    if period <= 1e-30:
+        raise ValueError("Degenerate streamwise coordinate range")
+
+    if x_target.min() >= lo - 1e-8 and x_target.max() <= hi + 1e-8:
+        xt = np.clip(x_target, lo, hi)
+    else:
+        xt = ((x_target - lo) % period) + lo
+        xt = np.where(np.isclose(xt, lo, atol=1e-8), lo, xt)
+
+    return np.interp(xt, xs, vs)
+
+
+def wall_coordinate_mismatch(x_src, x_target):
+    """Return max coordinate mismatch when direct index alignment is possible."""
+    if len(x_src) != len(x_target):
+        return float("inf")
+    return float(np.max(np.abs(np.asarray(x_src) - np.asarray(x_target))))
+
+
 # ============================================================
 #  2.  Visualiser
 # ============================================================
@@ -695,7 +853,9 @@ def _gamma_from_dz_norm_top(target_dz_norm, N, alpha=0.5, tol=1e-12):
 def compute_gamma_field(utau_bottom, utau_top, L_column,
                         Re, NZ_cells, alpha=0.5,
                         zp_target=0.9,
-                        smooth_max_width=9, smooth_sigma=3):
+                        smooth_max_width=9, smooth_sigma=3,
+                        normal_factor_bottom=None,
+                        normal_factor_top=None):
     """
     Compute streamwise-varying gamma(y) that achieves z+ <= zp_target
     at both walls simultaneously.
@@ -705,10 +865,12 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
     z+(y) = Re * u_tau(y) * d_n(y)
 
     For Vinokur tanh with symmetric alpha:
-        d_n(y) = L(y) * dz_norm(gamma(y), N)
+        d_z(y) = L(y) * dz_norm(gamma(y), N)
+        d_n(y) = d_z(y) * normal_factor(y)
 
     Setting z+ = zp_target and inverting:
-        dz_norm_required(y) = zp_target / (Re * u_tau_design(y) * L(y))
+        dz_norm_required(y) =
+            zp_target / (Re * u_tau_design(y) * L(y) * normal_factor(y))
         gamma(y) = dz_norm^{-1}(dz_norm_required)
 
     Smoothing strategy (one-sided safe)
@@ -717,7 +879,7 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
     Naive Gaussian smoothing of gamma would REDUCE peaks, causing
     under-resolution.  Instead:
 
-    1. u_tau_design = max(u_tau_bottom, u_tau_top)   at each station
+    1. Build a conservative u_tau_design for each wall separately
     2. max-filter (morphological dilation) with width W
        -> expands peaks so neighboring columns inherit strong clustering
     3. Gaussian smooth the max-filtered u_tau
@@ -725,8 +887,9 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
     4. Clamp: u_tau_design = max(u_tau_smooth, u_tau_raw)
        -> guarantees gamma never drops below the required value
 
-    This produces a smooth gamma(y) that is everywhere >= the raw
-    requirement, so z+ <= zp_target is guaranteed.
+    Taking the larger gamma required by either wall produces a smooth
+    gamma(y) that is everywhere >= the raw requirement, so z+ <=
+    zp_target is guaranteed.
 
     Parameters
     ----------
@@ -746,6 +909,9 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
         Max-filter window width (odd, in streamwise grid points).
     smooth_sigma : float
         Gaussian smoothing sigma (in grid points).
+    normal_factor_bottom, normal_factor_top : array-like or None
+        Ratio d_n / d_z at each wall.  Use factors from grid geometry for
+        sloped walls; defaults to 1.0 for backward-compatible flat-wall use.
 
     Returns
     -------
@@ -762,6 +928,17 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
 
     NY = len(utau_bottom)
     N = NZ_cells
+    if normal_factor_bottom is None:
+        normal_factor_bottom = np.ones(NY)
+    else:
+        normal_factor_bottom = np.asarray(normal_factor_bottom, dtype=float)
+    if normal_factor_top is None:
+        normal_factor_top = np.ones(NY)
+    else:
+        normal_factor_top = np.asarray(normal_factor_top, dtype=float)
+
+    if len(normal_factor_bottom) != NY or len(normal_factor_top) != NY:
+        raise ValueError("normal_factor arrays must match u_tau length")
 
     # Smooth u_tau for each wall independently (one-sided safe)
     def _smooth_utau(utau):
@@ -777,8 +954,10 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
     # For each station, compute gamma required by EACH wall, take the max.
     # Bottom wall uses _dz_norm_closed_form / _gamma_from_dz_norm.
     # Top wall uses _dz_norm_top_closed_form / _gamma_from_dz_norm_top.
-    dzn_req_bot = zp_target / (Re * utau_design_bot * L_column)
-    dzn_req_top = zp_target / (Re * utau_design_top * L_column)
+    dzn_req_bot = zp_target / (
+        Re * utau_design_bot * L_column * normal_factor_bottom)
+    dzn_req_top = zp_target / (
+        Re * utau_design_top * L_column * normal_factor_top)
 
     gamma_bot = np.array([_gamma_from_dz_norm(d, N, alpha) for d in dzn_req_bot])
     gamma_top = np.array([_gamma_from_dz_norm_top(d, N, alpha) for d in dzn_req_top])
@@ -787,8 +966,10 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
     # Compute actual z+ at both walls using the correct wall spacing
     dzn_bot = np.array([_dz_norm_closed_form(g, N, alpha) for g in gamma_y])
     dzn_top = np.array([_dz_norm_top_closed_form(g, N, alpha) for g in gamma_y])
-    dn_bot = dzn_bot * L_column
-    dn_top = dzn_top * L_column
+    dz_bot = dzn_bot * L_column
+    dz_top = dzn_top * L_column
+    dn_bot = dz_bot * normal_factor_bottom
+    dn_top = dz_top * normal_factor_top
 
     zp_bot = Re * utau_bottom * dn_bot
     zp_top = Re * utau_top * dn_top
@@ -805,6 +986,10 @@ def compute_gamma_field(utau_bottom, utau_top, L_column,
         "dzn_required_top": dzn_req_top,
         "dzn_bot": dzn_bot,
         "dzn_top": dzn_top,
+        "normal_factor_bot": normal_factor_bottom,
+        "normal_factor_top": normal_factor_top,
+        "dz_bot": dz_bot,
+        "dz_top": dz_top,
         "dn_bot": dn_bot,
         "dn_top": dn_top,
         "zp_bot": zp_bot,
@@ -1494,23 +1679,34 @@ def verify_zplus(grid_dat, utau_bot_dat, utau_top_dat, Re,
         gamma_back : 1D array  back-calculated gamma at each column
     """
     x, y, ni, nj = parse_tecplot_dat(grid_dat)
-    _, z_bot, utau_b, n_bot = parse_utau_dat(utau_bot_dat)
-    _, z_top, utau_t, n_top = parse_utau_dat(utau_top_dat)
-
-    if n_bot != ni or n_top != ni:
-        print(f"  WARNING: u_tau points ({n_bot}/{n_top}) != grid I={ni}")
+    y_bot_src, _, utau_b_src, n_bot = parse_utau_dat(utau_bot_dat)
+    y_top_src, _, utau_t_src, n_top = parse_utau_dat(utau_top_dat)
 
     # Auto-detect physical vs code units (same logic as write_grid_data)
-    x_max = float(x[0, -1])
-    LY = 9.0
-    if x_max < 0.5 * LY:
-        grid_scale = 1.0 / (x_max / LY)
-    else:
-        grid_scale = 1.0
+    grid_scale = infer_grid_scale(x, LY=9.0)
+    x_bot_target = x[0, :] * grid_scale
+    x_top_target = x[-1, :] * grid_scale
 
-    # Actual first-cell spacing from grid (both walls)
-    dn_bot = np.abs(y[1, :] - y[0, :]) * grid_scale
-    dn_top = np.abs(y[-1, :] - y[-2, :]) * grid_scale
+    bot_mismatch = wall_coordinate_mismatch(y_bot_src, x_bot_target)
+    top_mismatch = wall_coordinate_mismatch(y_top_src, x_top_target)
+    if n_bot != ni or bot_mismatch > 1e-8:
+        print(f"  INFO: interpolating bottom u_tau onto grid stations "
+              f"(points {n_bot}->{ni}, max dx={bot_mismatch:.3e})")
+    if n_top != ni or top_mismatch > 1e-8:
+        print(f"  INFO: interpolating top u_tau onto grid stations "
+              f"(points {n_top}->{ni}, max dx={top_mismatch:.3e})")
+
+    utau_b = interpolate_wall_series(y_bot_src, utau_b_src, x_bot_target)
+    utau_t = interpolate_wall_series(y_top_src, utau_t_src, x_top_target)
+
+    # Actual first-cell wall-normal spacing from grid geometry.
+    # Bottom wall is curved, so vertical dz would under-estimate z+ on slopes.
+    dz_bot_grid = np.abs(y[1, :] - y[0, :]) * grid_scale
+    dz_top_grid = np.abs(y[-1, :] - y[-2, :]) * grid_scale
+    dn_bot, _, _ = wall_normal_first_cell_spacing(
+        x, y, "bottom", scale_factor=grid_scale)
+    dn_top, _, _ = wall_normal_first_cell_spacing(
+        x, y, "top", scale_factor=grid_scale)
 
     zp_bot = Re * utau_b * dn_bot
     zp_top = Re * utau_t * dn_top
@@ -1523,8 +1719,10 @@ def verify_zplus(grid_dat, utau_bot_dat, utau_top_dat, Re,
     for i in range(ni):
         L_i = (y[-1, i] - y[0, i]) * grid_scale
         if L_i > 1e-30:
-            gamma_back_bot[i] = _gamma_from_dz_norm(dn_bot[i] / L_i, NZ_cells, alpha)
-            gamma_back_top[i] = _gamma_from_dz_norm_top(dn_top[i] / L_i, NZ_cells, alpha)
+            gamma_back_bot[i] = _gamma_from_dz_norm(
+                dz_bot_grid[i] / L_i, NZ_cells, alpha)
+            gamma_back_top[i] = _gamma_from_dz_norm_top(
+                dz_top_grid[i] / L_i, NZ_cells, alpha)
         else:
             gamma_back_bot[i] = 0.0
             gamma_back_top[i] = 0.0
@@ -1577,16 +1775,20 @@ def verify_zplus(grid_dat, utau_bot_dat, utau_top_dat, Re,
     # Optional: write detailed report
     if report_path is not None:
         report_path = Path(report_path)
-        with open(report_path, "w", encoding="utf-8") as rf:
-            rf.write(f'TITLE = "z+ verification"\n')
-            rf.write('VARIABLES = "j" "zp_bot" "zp_top" "zp_max" '
-                      '"dn_bot" "dn_top" "gamma_back"\n')
-            rf.write(f'ZONE T="verify", I={ni}, F=POINT\n')
-            for i in range(ni):
-                rf.write(f"  {i:4d} {zp_bot[i]:10.6f} {zp_top[i]:10.6f} "
-                         f"{zp_all[i]:10.6f} {dn_bot[i]:14.8e} "
-                         f"{dn_top[i]:14.8e} {gamma_back[i]:10.6f}\n")
-        print(f"  [written] {report_path}")
+        try:
+            with open(report_path, "w", encoding="utf-8") as rf:
+                rf.write(f'TITLE = "z+ verification"\n')
+                rf.write('VARIABLES = "j" "zp_bot" "zp_top" "zp_max" '
+                         '"dn_bot" "dn_top" "gamma_back"\n')
+                rf.write(f'ZONE T="verify", I={ni}, F=POINT\n')
+                for i in range(ni):
+                    rf.write(
+                        f"  {i:4d} {zp_bot[i]:10.6f} {zp_top[i]:10.6f} "
+                        f"{zp_all[i]:10.6f} {dn_bot[i]:14.8e} "
+                        f"{dn_top[i]:14.8e} {gamma_back[i]:10.6f}\n")
+            print(f"  [written] {report_path}")
+        except OSError as exc:
+            print(f"  WARNING: could not write {report_path}: {exc}")
 
     return {
         "ok": ok,
@@ -1603,7 +1805,9 @@ def verify_zplus(grid_dat, utau_bot_dat, utau_top_dat, Re,
 
 
 def sensitivity_analysis(gamma_field, gamma_field_info, L_column,
-                          Re, NZ_cells, alpha=0.5, report_path=None):
+                          Re, NZ_cells, alpha=0.5, report_path=None,
+                          normal_factor_bottom=None,
+                          normal_factor_top=None):
     """
     Pre-simulation sensitivity analysis.
 
@@ -1614,7 +1818,7 @@ def sensitivity_analysis(gamma_field, gamma_field_info, L_column,
     How much can u_tau change on the NEW grid before z+ > 1.0?"
 
     At each station j, the grid has a fixed first-cell spacing:
-        d_n(j) = L(j) * dz_norm(gamma(j), N)
+        d_n(j) = L(j) * dz_norm(gamma(j), N) * normal_factor(j)
 
     The designed z+ was:
         z+_designed(j) = Re * u_tau_old(j) * d_n(j)
@@ -1640,12 +1844,21 @@ def sensitivity_analysis(gamma_field, gamma_field_info, L_column,
     gi = gamma_field_info
     NY = len(gamma_field)
     N = NZ_cells
+    if normal_factor_bottom is None:
+        normal_factor_bottom = gi.get("normal_factor_bot", np.ones(NY))
+    if normal_factor_top is None:
+        normal_factor_top = gi.get("normal_factor_top", np.ones(NY))
+    normal_factor_bottom = np.asarray(normal_factor_bottom, dtype=float)
+    normal_factor_top = np.asarray(normal_factor_top, dtype=float)
+
+    if len(normal_factor_bottom) != NY or len(normal_factor_top) != NY:
+        raise ValueError("normal_factor arrays must match gamma_field length")
 
     # Compute first-cell spacing at BOTH walls
     dzn_bot = np.array([_dz_norm_closed_form(g, N, alpha) for g in gamma_field])
     dzn_top = np.array([_dz_norm_top_closed_form(g, N, alpha) for g in gamma_field])
-    dn_bot = dzn_bot * L_column
-    dn_top = dzn_top * L_column
+    dn_bot = dzn_bot * L_column * normal_factor_bottom
+    dn_top = dzn_top * L_column * normal_factor_top
 
     # Critical u_tau at each wall (the u_tau that would make z+=1.0)
     utau_crit_bot = 1.0 / (Re * dn_bot)
@@ -2331,9 +2544,24 @@ if __name__ == "__main__":
         print(f"  Top:    {top_path.name}  ({n_top} points)")
         print(f"    u_tau range: [{utau_top_arr.min():.6f}, {utau_top_arr.max():.6f}]")
 
-        if n_bot != ni_ref or n_top != ni_ref:
-            print(f"\n  WARNING: u_tau data ({n_bot}/{n_top} pts) vs grid I={ni_ref}")
-            print("  Dimensions should match. Proceeding anyway ...")
+        ref_scale = infer_grid_scale(x_ref, LY=9.0)
+        x_bot_target = x_ref[0, :] * ref_scale
+        x_top_target = x_ref[-1, :] * ref_scale
+        bot_mismatch = wall_coordinate_mismatch(y_bot_ut, x_bot_target)
+        top_mismatch = wall_coordinate_mismatch(y_top_ut, x_top_target)
+        if n_bot != ni_ref or bot_mismatch > 1e-8:
+            print(f"  Interpolating bottom u_tau onto grid stations "
+                  f"(points {n_bot}->{ni_ref}, max dx={bot_mismatch:.3e})")
+        if n_top != ni_ref or top_mismatch > 1e-8:
+            print(f"  Interpolating top u_tau onto grid stations "
+                  f"(points {n_top}->{ni_ref}, max dx={top_mismatch:.3e})")
+
+        utau_bot_arr = interpolate_wall_series(y_bot_ut, utau_bot_arr, x_bot_target)
+        z_bot_ut = interpolate_wall_series(y_bot_ut, z_bot_ut, x_bot_target)
+        y_bot_ut = x_bot_target
+        utau_top_arr = interpolate_wall_series(y_top_ut, utau_top_arr, x_top_target)
+        z_top_ut = interpolate_wall_series(y_top_ut, z_top_ut, x_top_target)
+        y_top_ut = x_top_target
 
         # ── column heights from u_tau data (code units, not grid units) ──
         # u_tau files contain z-coordinates in code units (H_HILL=1),
@@ -2342,6 +2570,14 @@ if __name__ == "__main__":
         L_col = z_top_ut - z_bot_ut
         print(f"  Column height L(y): [{L_col.min():.4f}, {L_col.max():.4f}] "
               f"(from u_tau files, code units)")
+
+        normal_factor_bot, normal_factor_top = wall_normal_projection_factors(
+            x_ref, y_ref, scale_factor=ref_scale)
+        print("  Wall-normal projection factor d_n/d_z:")
+        print(f"    bottom: [{normal_factor_bot.min():.4f}, "
+              f"{normal_factor_bot.max():.4f}]")
+        print(f"    top:    [{normal_factor_top.min():.4f}, "
+              f"{normal_factor_top.max():.4f}]")
 
         # ── Re ──
         RE_val = ask_float("Re (Reynolds number)", default=5600, lo=1)
@@ -2380,7 +2616,9 @@ if __name__ == "__main__":
             utau_bot_arr, utau_top_arr, L_col,
             Re=RE_val, NZ_cells=NZ_cells, alpha=ALPHA,
             zp_target=ZP_TARGET,
-            smooth_max_width=SMOOTH_W, smooth_sigma=SMOOTH_S)
+            smooth_max_width=SMOOTH_W, smooth_sigma=SMOOTH_S,
+            normal_factor_bottom=normal_factor_bot,
+            normal_factor_top=normal_factor_top)
 
         gi = gamma_field_info
         print(f"  gamma(y) range:  [{gamma_field.min():.3f}, {gamma_field.max():.3f}]")
@@ -2418,6 +2656,8 @@ if __name__ == "__main__":
         sens = sensitivity_analysis(
             gamma_field, gamma_field_info, L_col,
             Re=RE_val, NZ_cells=NZ_cells, alpha=ALPHA,
+            normal_factor_bottom=normal_factor_bot,
+            normal_factor_top=normal_factor_top,
             report_path=sens_report)
 
     # -----------------------------------------------------------
