@@ -1,0 +1,6 @@
+1. 呼叫高解析度資料點生成python code : grid_zeta_tool.py 
+2. 讀取初始資料點 (使用者需要自己加入檔案 : 
+   A. "1.I257_J129_g2.0_a0.5.dat"
+   B. 舊頂壁Z+ : "28.Re5600_j257_zplus_top_spanavg_2nd.dat" 
+   C. 舊底壁Z+ : "29.Re5600_j257_zplus_bottom_normal_spanavg_2nd.dat" 
+3. 生成高解析度網格點 : "adaptive_*.dat"
