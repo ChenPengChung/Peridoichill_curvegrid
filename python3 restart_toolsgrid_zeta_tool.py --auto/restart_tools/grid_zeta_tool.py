@@ -2269,9 +2269,9 @@ def _auto_mode3(params, vh_dir, grid_dir, ref_path, out_path, grid_key, script_d
                     source_dat=out_path.name)
 
     sens_path = grid_dir / f"sensitivity_{tag}.dat"
-    sensitivity_analysis(gamma_field, gamma_info, L_col,
-                         Re=utau_re, NZ_cells=NZ_cells, alpha=alpha,
-                         report_path=sens_path)
+    sens = sensitivity_analysis(gamma_field, gamma_info, L_col,
+                                Re=utau_re, NZ_cells=NZ_cells, alpha=alpha,
+                                report_path=sens_path)
 
     gamma_table = grid_dir / f"gamma_field_{tag}.dat"
     with open(gamma_table, "w") as gf:
@@ -2289,6 +2289,56 @@ def _auto_mode3(params, vh_dir, grid_dir, ref_path, out_path, grid_key, script_d
                  labels=["Base topology", f"Variable gamma (z+<{zp_target})"],
                  title=f"Mode 3: Re={utau_re}, z+_target={zp_target}",
                  savepath=grid_dir / f"compare_auto_{tag}.png")
+
+    # ── Diagnostic plots (gamma field + sensitivity) ──
+    gi = gamma_info
+    if _HAS_MPL:
+        fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+        axes[0].plot(range(NI), gamma_field, 'b-', lw=1.5)
+        axes[0].set_ylabel("gamma(y)")
+        axes[0].set_title("Variable gamma(y) field")
+        axes[0].grid(True, ls='--', alpha=0.4)
+
+        axes[1].plot(range(NI), gi["utau_raw"], 'k-', lw=0.8, label="u_tau raw")
+        axes[1].plot(range(NI), gi["utau_design"], 'r-', lw=1.2,
+                     label="u_tau design (smoothed)")
+        axes[1].set_ylabel("u_tau")
+        axes[1].legend(fontsize=9)
+        axes[1].grid(True, ls='--', alpha=0.4)
+
+        axes[2].plot(range(NI), gi["zp_bot"], 'b-', lw=0.8, label="z+ bottom")
+        axes[2].plot(range(NI), gi["zp_top"], 'r-', lw=0.8, label="z+ top")
+        axes[2].plot(range(NI), gi["zp_max"], 'k-', lw=1.2, label="z+ max")
+        axes[2].axhline(1.0, color='gray', ls='--', lw=0.8)
+        axes[2].set_ylabel("z+")
+        axes[2].set_xlabel("streamwise index j")
+        axes[2].legend(fontsize=9)
+        axes[2].grid(True, ls='--', alpha=0.4)
+
+        plt.tight_layout()
+        gplot_path = grid_dir / f"gamma_field_{tag}.png"
+        fig.savefig(gplot_path, dpi=200)
+        print(f"  [saved] {gplot_path}")
+        plt.close(fig)
+
+        fig_s, ax_s = plt.subplots(figsize=(14, 5))
+        ax_s.fill_between(range(NI), sens["margin_vs_raw"] * 100,
+                          color='green', alpha=0.3, label="margin vs raw u_tau")
+        ax_s.plot(range(NI), sens["margin_vs_raw"] * 100, 'g-', lw=1.0)
+        ax_s.plot(range(NI), sens["margin_vs_design"] * 100,
+                  'b--', lw=1.0, label="margin vs design u_tau")
+        ax_s.axhline(0, color='red', ls='-', lw=1.5)
+        ax_s.set_xlabel("streamwise index j")
+        ax_s.set_ylabel("margin before z+ > 1.0 (%)")
+        ax_s.set_title("Sensitivity: u_tau increase tolerance at each station")
+        ax_s.legend(fontsize=9)
+        ax_s.grid(True, ls='--', alpha=0.4)
+        plt.tight_layout()
+        splot_path = grid_dir / f"sensitivity_{tag}.png"
+        fig_s.savefig(splot_path, dpi=200)
+        print(f"  [saved] {splot_path}")
+        plt.close(fig_s)
 
     # ── Summary ──
     print()
